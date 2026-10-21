@@ -253,79 +253,84 @@ def apply_optical_liquid_glass_shader(
     y_idx, x_idx = np.mgrid[0:h, 0:w].astype(np.float32)
 
     alpha_mask = smooth_step(0.75, -0.75, sdf)
-
     depth = np.maximum(0.0, -sdf)
-    u = np.clip(1.0 - depth / max(1.0, refraction_height), 0.0, 1.0)
+    inside = sdf < 0.005
 
-    smooth_u = smooth_step(0.0, 1.0, u)
-    lens_curve = 0.55 * (1.0 - np.sqrt(np.maximum(0.0, 1.0 - u * u))) + 0.45 * smooth_u * u
-    disp_mag = -refraction_amount * lens_curve
+    # Liquid Glass Studio-style edge refraction model.
+    ref_thickness = max(1.0, refraction_height)
+    x_r_ratio = 1.0 - depth / ref_thickness
+    theta_i = np.arcsin(np.clip(x_r_ratio * x_r_ratio, -1.0, 1.0))
+    ref_factor = 1.40
+    theta_t = np.arcsin(np.clip((1.0 / ref_factor) * np.sin(theta_i), -1.0, 1.0))
+    edge_factor = -np.tan(theta_t - theta_i)
+    edge_factor = np.where(depth >= ref_thickness, 0.0, edge_factor)
+    edge_factor = np.clip(edge_factor, 0.0, 4.0)
 
-    edge_factor = np.clip(depth / 1.8, 0.20, 1.0)
-    disp_mag = disp_mag * edge_factor
+    ref_distance = refraction_amount / max(1.0, min(half_w, half_h))
+    shift_x = -grad_x * edge_factor * ref_distance * max(half_w, 1.0)
+    shift_y = -grad_y * edge_factor * ref_distance * max(half_h, 1.0)
 
-    rx = (x_idx - cx) / max(1.0, half_w)
-    ry = (y_idx - cy) / max(1.0, half_h)
-    r_len = np.hypot(rx, ry) + 1e-6
-    dir_x = grad_x + 0.20 * (rx / r_len)
-    dir_y = grad_y + 0.20 * (ry / r_len)
-    d_norm = np.hypot(dir_x, dir_y) + 1e-6
-    dir_x /= d_norm
-    dir_y /= d_norm
+    base_mix = np.clip(depth / ref_thickness, 0.0, 1.0)
+    blur_mix = np.where(edge_factor > 0.0, 1.0, base_mix)
+    base_rgb = sharp_backdrop * (1.0 - blur_mix[..., None]) + frosted_backdrop * blur_mix[..., None]
 
-    dx = disp_mag * dir_x
-    dy = disp_mag * dir_y
-
-    ab = chromatic_aberration
-    scale_r = 1.0 + 0.065 * ab
-    scale_g = 1.0
-    scale_b = 1.0 - 0.065 * ab
-
-    edge_mask = np.clip((u * u) * 0.72, 0.0, 1.0)
-    base_source = frosted_backdrop * (1.0 - edge_mask[..., None]) + sharp_backdrop * edge_mask[..., None]
-
-    sr = bilinear_sample_channel(base_source[..., 0], x_idx + dx * scale_r, y_idx + dy * scale_r)
-    sg = bilinear_sample_channel(base_source[..., 1], x_idx + dx * scale_g, y_idx + dy * scale_g)
-    sb = bilinear_sample_channel(base_source[..., 2], x_idx + dx * scale_b, y_idx + dy * scale_b)
-    aberrated_rgb = np.stack([sr, sg, sb], axis=-1)
-
-    center_clean = bilinear_sample_rgb(frosted_backdrop, x_idx + dx * 0.38, y_idx + dy * 0.38)
-    glass_rgb = center_clean * (1.0 - edge_mask[..., None]) + aberrated_rgb * edge_mask[..., None]
-
-    lum = 0.299 * glass_rgb[..., 0] + 0.587 * glass_rgb[..., 1] + 0.114 * glass_rgb[..., 2]
-    frost_lift = np.clip((195.0 - lum) / 195.0, 0.0, 1.0) * 0.38 + 0.14
-    glass_rgb = glass_rgb * (1.0 - frost_lift[..., None]) + np.array([244.0, 250.0, 255.0], dtype=np.float32) * frost_lift[..., None]
+    # Studio dispersion constants: N_R=0.98, N_G=1.0, N_B=1.02.
+    disp = chromatic_aberration * 3.5
+    sr = bilinear_sample_channel(base_rgb[..., 0], x_idx + shift_x * (1.0 + 0.02 * disp), y_idx + shift_y * (1.0 + 0.02 * disp))
+    sg = bilinear_sample_channel(base_rgb[..., 1], x_idx + shift_x, y_idx + shift_y)
+    sb = bilinear_sample_channel(base_rgb[..., 2], x_idx + shift_x * (1.0 - 0.02 * disp), y_idx + shift_y * (1.0 - 0.02 * disp))
+    glass_rgb = np.stack([sr, sg, sb], axis=-1)
 
     if tint_opacity > 0.001:
         t_col = np.array(tint_rgb, dtype=np.float32)
-        glass_rgb = glass_rgb * (1.0 - tint_opacity) + t_col * tint_opacity
+        glass_rgb = glass_rgb * (1.0 - tint_opacity * 0.8) + t_col * (tint_opacity * 0.8)
 
-    caustic = np.exp(-0.5 * ((depth - 3.0) / 1.8) ** 2) * (0.18 if is_hovered or is_active else 0.10)
-    glass_rgb += caustic[..., None] * (255.0 - glass_rgb)
+    # Fresnel and glare terms adapted from Liquid Glass Studio main fragment pass.
+    fresnel = np.clip(
+        np.power(
+            np.clip(
+                1.0 + (sdf / 1500.0) * ((500.0 / 30.0) ** 2) + 0.20,
+                0.0,
+                2.0,
+            ),
+            5.0,
+        ),
+        0.0,
+        1.0,
+    )
+    glare_geo = np.clip(
+        np.power(
+            np.clip(
+                1.0 + (sdf / 1500.0) * ((500.0 / 30.0) ** 2) + 0.20,
+                0.0,
+                2.0,
+            ),
+            5.0,
+        ),
+        0.0,
+        1.0,
+    )
+    normal_ang = np.arctan2(grad_y, grad_x)
+    glare_ang = (normal_ang - (math.pi * 0.25) + math.radians(light_angle_deg)) * 2.0
+    glare_far = np.where(
+        ((glare_ang > math.pi * 1.5) & (glare_ang < math.pi * 3.5)) | (glare_ang < -math.pi * 0.5),
+        1.0,
+        0.0,
+    )
+    glare_angle = (0.5 + np.sin(glare_ang) * 0.5) * np.where(glare_far > 0.5, 0.96, 1.2)
+    glare_angle = np.clip(np.power(np.clip(glare_angle * 0.9, 0.0, 1.0), 1.1), 0.0, 1.0)
 
-    if is_hovered or is_active:
-        top_dist = np.hypot(rx * 0.85, (y_idx - (cy - half_h)) / max(1.0, 2.0 * half_h))
-        radial_top = np.clip(1.0 - top_dist / 0.85, 0.0, 1.0)
-        radial_top = radial_top * radial_top
-        hover_op = 0.26 if is_active else 0.16
-        glass_rgb = glass_rgb + radial_top[..., None] * (255.0 - glass_rgb) * hover_op
+    fresnel_mix = np.clip(fresnel * 0.24, 0.0, 0.45)[..., None]
+    glare_mix = np.clip(glare_angle * glare_geo * (0.28 if is_hovered or is_active else 0.18), 0.0, 0.55)[..., None]
+    glass_rgb = glass_rgb * (1.0 - fresnel_mix) + 255.0 * fresnel_mix
+    glass_rgb = glass_rgb * (1.0 - glare_mix) + 255.0 * glare_mix
 
-    ang_rad = math.radians(light_angle_deg)
-    lx, ly = math.cos(ang_rad), math.sin(ang_rad)
-    proj = np.clip((rx * lx + ry * ly) * 0.5 + 0.5, 0.0, 1.0)
-    dot_l = np.abs(grad_x * lx + grad_y * ly)
+    # Keep antialiased transition with untouched backdrop outside the glass.
+    smooth_edge = smooth_step(-0.75, 0.75, sdf)
+    out_rgb = glass_rgb * inside[..., None] + sharp_backdrop * (~inside)[..., None]
+    out_rgb = out_rgb * (1.0 - smooth_edge[..., None]) + sharp_backdrop * smooth_edge[..., None]
 
-    rim_band = np.exp(-0.5 * (sdf / 0.72) ** 2)
-    inset_line = np.exp(-0.5 * ((depth - 2.2) / 0.75) ** 2) * 0.18
-
-    border_spec = rim_band * (0.55 + 0.35 * proj + 0.25 * dot_l) + inset_line
-    if is_hovered or is_active:
-        border_spec *= 1.18
-
-    border_spec = np.clip(border_spec, 0.0, 0.96)[..., None]
-    glass_rgb = glass_rgb * (1.0 - border_spec) + 255.0 * border_spec
-
-    return np.clip(glass_rgb, 0.0, 255.0), alpha_mask
+    return np.clip(out_rgb, 0.0, 255.0), alpha_mask
 
 
 _PILL_ROI_CACHE: dict[tuple, tuple[np.ndarray, np.ndarray, np.ndarray | None]] = {}
