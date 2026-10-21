@@ -53,6 +53,66 @@ def smooth_step(a: float, b: float, t: np.ndarray) -> np.ndarray:
     return u * u * (3.0 - 2.0 * u)
 
 
+LGS_REF_FACTOR = 1.4
+LGS_REF_DISPERSION = 7.0
+LGS_REF_FRESNEL_RANGE = 30.0
+LGS_REF_FRESNEL_HARDNESS = 0.20
+LGS_REF_FRESNEL_FACTOR = 0.20
+LGS_GLARE_RANGE = 30.0
+LGS_GLARE_HARDNESS = 0.20
+LGS_GLARE_FACTOR = 0.90
+LGS_GLARE_CONVERGENCE = 0.50
+LGS_GLARE_OPPOSITE_FACTOR = 0.80
+LGS_GLARE_ANGLE_DEG = -45.0
+
+
+def _uncompand_srgb(x: np.ndarray) -> np.ndarray:
+    return np.where(x > 0.04045, np.power((x + 0.055) / 1.055, 2.4), x / 12.92)
+
+
+def _compand_rgb(x: np.ndarray) -> np.ndarray:
+    return np.where(x <= 0.0031308, 12.92 * x, 1.055 * np.power(np.maximum(0.0, x), 1.0 / 2.4) - 0.055)
+
+
+def _srgb_to_lch(rgb01: np.ndarray) -> np.ndarray:
+    rgb = _uncompand_srgb(np.clip(rgb01, 0.0, 1.0))
+    x = rgb[..., 0] * 0.4124 + rgb[..., 1] * 0.3576 + rgb[..., 2] * 0.1805
+    y = rgb[..., 0] * 0.2126 + rgb[..., 1] * 0.7152 + rgb[..., 2] * 0.0722
+    z = rgb[..., 0] * 0.0193 + rgb[..., 1] * 0.1192 + rgb[..., 2] * 0.9505
+
+    xn, yn, zn = 0.95045592705, 1.0, 1.08905775076
+    xr, yr, zr = x / xn, y / yn, z / zn
+    f = lambda t: np.where(t > 0.00885645167, np.power(t, 1.0 / 3.0), 7.78703703704 * t + 0.13793103448)
+    fx, fy, fz = f(xr), f(yr), f(zr)
+    l = 116.0 * fy - 16.0
+    a = 500.0 * (fx - fy)
+    b = 200.0 * (fy - fz)
+    c = np.hypot(a, b)
+    h = np.degrees(np.arctan2(b, a))
+    return np.stack([l, c, h], axis=-1)
+
+
+def _lch_to_srgb(lch: np.ndarray) -> np.ndarray:
+    l = lch[..., 0]
+    c = np.maximum(0.0, lch[..., 1])
+    h = np.radians(lch[..., 2])
+    a = c * np.cos(h)
+    b = c * np.sin(h)
+    w = (l + 16.0) / 116.0
+
+    f_inv = lambda t: np.where(t > 0.206897, t * t * t, 0.12841854934 * (t - 0.137931034))
+    xn, yn, zn = 0.95045592705, 1.0, 1.08905775076
+    x = xn * f_inv(w + a / 500.0)
+    y = yn * f_inv(w)
+    z = zn * f_inv(w - b / 200.0)
+
+    r = x * 3.2406255 + y * -1.537208 + z * -0.4986286
+    g = x * -0.9689307 + y * 1.8757561 + z * 0.0415175
+    bl = x * 0.0557101 + y * -0.2040211 + z * 1.0569959
+    srgb = _compand_rgb(np.stack([r, g, bl], axis=-1))
+    return np.clip(srgb, 0.0, 1.0)
+
+
 def _backdrop_signature(arr: np.ndarray) -> tuple:
     h, w, _ = arr.shape
     return (
@@ -241,95 +301,122 @@ def apply_optical_liquid_glass_shader(
     half_h: float,
     refraction_height: float = 28.0,
     refraction_amount: float = 38.0,
-    chromatic_aberration: float = 2.0,
+    chromatic_aberration: float = LGS_REF_DISPERSION,
     tint_rgb: tuple[float, float, float] = (255.0, 255.0, 255.0),
     tint_opacity: float = 0.0,
     is_hovered: bool = False,
     is_active: bool = False,
-    light_angle_deg: float = 135.0,
+    light_angle_deg: float = LGS_GLARE_ANGLE_DEG,
     mouse_offset: tuple[float, float] = (0.0, 0.0),
+    ref_factor: float = LGS_REF_FACTOR,
+    ref_fresnel_range: float = LGS_REF_FRESNEL_RANGE,
+    ref_fresnel_hardness: float = LGS_REF_FRESNEL_HARDNESS,
+    ref_fresnel_factor: float = LGS_REF_FRESNEL_FACTOR,
+    glare_range: float = LGS_GLARE_RANGE,
+    glare_hardness: float = LGS_GLARE_HARDNESS,
+    glare_factor: float = LGS_GLARE_FACTOR,
+    glare_convergence: float = LGS_GLARE_CONVERGENCE,
+    glare_opposite_factor: float = LGS_GLARE_OPPOSITE_FACTOR,
+    blur_edge: bool = True,
 ) -> tuple[np.ndarray, np.ndarray]:
     h, w, _ = sharp_backdrop.shape
     y_idx, x_idx = np.mgrid[0:h, 0:w].astype(np.float32)
 
     alpha_mask = smooth_step(0.75, -0.75, sdf)
-    depth = np.maximum(0.0, -sdf)
     inside = sdf < 0.005
-
-    # Liquid Glass Studio-style edge refraction model.
+    nmerged = np.maximum(0.0, -sdf)
     ref_thickness = max(1.0, refraction_height)
-    x_r_ratio = 1.0 - depth / ref_thickness
-    theta_i = np.arcsin(np.clip(x_r_ratio * x_r_ratio, -1.0, 1.0))
-    ref_factor = 1.40
-    theta_t = np.arcsin(np.clip((1.0 / ref_factor) * np.sin(theta_i), -1.0, 1.0))
+
+    x_r_ratio = 1.0 - nmerged / ref_thickness
+    theta_i = np.arcsin(np.clip(np.power(x_r_ratio, 2.0), -1.0, 1.0))
+    theta_t = np.arcsin(np.clip((1.0 / max(1.01, ref_factor)) * np.sin(theta_i), -1.0, 1.0))
     edge_factor = -np.tan(theta_t - theta_i)
-    edge_factor = np.where(depth >= ref_thickness, 0.0, edge_factor)
-    edge_factor = np.clip(edge_factor, 0.0, 4.0)
+    edge_factor = np.where(nmerged >= ref_thickness, 0.0, edge_factor)
+    edge_factor = np.clip(edge_factor, 0.0, 12.0)
 
-    ref_distance = refraction_amount / max(1.0, min(half_w, half_h))
-    shift_x = -grad_x * edge_factor * ref_distance * max(half_w, 1.0)
-    shift_y = -grad_y * edge_factor * ref_distance * max(half_h, 1.0)
+    edge_h = np.clip(nmerged / ref_thickness, 0.0, 1.0)
+    mix_rate = np.where(blur_edge, 1.0, edge_h)
 
-    base_mix = np.clip(depth / ref_thickness, 0.0, 1.0)
-    blur_mix = np.where(edge_factor > 0.0, 1.0, base_mix)
-    base_rgb = sharp_backdrop * (1.0 - blur_mix[..., None]) + frosted_backdrop * blur_mix[..., None]
+    offset_scale = np.clip(refraction_amount, 0.0, 0.2) * float(h)
+    shift_x = -grad_x * edge_factor * offset_scale
+    shift_y = -grad_y * edge_factor * offset_scale
 
-    # Studio dispersion constants: N_R=0.98, N_G=1.0, N_B=1.02.
-    disp = chromatic_aberration * 3.5
-    sr = bilinear_sample_channel(base_rgb[..., 0], x_idx + shift_x * (1.0 + 0.02 * disp), y_idx + shift_y * (1.0 + 0.02 * disp))
-    sg = bilinear_sample_channel(base_rgb[..., 1], x_idx + shift_x, y_idx + shift_y)
-    sb = bilinear_sample_channel(base_rgb[..., 2], x_idx + shift_x * (1.0 - 0.02 * disp), y_idx + shift_y * (1.0 - 0.02 * disp))
-    glass_rgb = np.stack([sr, sg, sb], axis=-1)
+    disp = np.clip(chromatic_aberration, 0.0, 50.0)
+    sx_r = x_idx + shift_x * (1.0 + 0.02 * disp)
+    sy_r = y_idx + shift_y * (1.0 + 0.02 * disp)
+    sx_g = x_idx + shift_x
+    sy_g = y_idx + shift_y
+    sx_b = x_idx + shift_x * (1.0 - 0.02 * disp)
+    sy_b = y_idx + shift_y * (1.0 - 0.02 * disp)
 
-    if tint_opacity > 0.001:
-        t_col = np.array(tint_rgb, dtype=np.float32)
-        glass_rgb = glass_rgb * (1.0 - tint_opacity * 0.8) + t_col * (tint_opacity * 0.8)
+    bg_r = bilinear_sample_channel(sharp_backdrop[..., 0], sx_r, sy_r)
+    bg_g = bilinear_sample_channel(sharp_backdrop[..., 1], sx_g, sy_g)
+    bg_b = bilinear_sample_channel(sharp_backdrop[..., 2], sx_b, sy_b)
+    blur_r = bilinear_sample_channel(frosted_backdrop[..., 0], sx_r, sy_r)
+    blur_g = bilinear_sample_channel(frosted_backdrop[..., 1], sx_g, sy_g)
+    blur_b = bilinear_sample_channel(frosted_backdrop[..., 2], sx_b, sy_b)
+    glass_rgb = np.stack([
+        bg_r * (1.0 - mix_rate) + blur_r * mix_rate,
+        bg_g * (1.0 - mix_rate) + blur_g * mix_rate,
+        bg_b * (1.0 - mix_rate) + blur_b * mix_rate,
+    ], axis=-1)
 
-    # Fresnel and glare terms adapted from Liquid Glass Studio main fragment pass.
-    fresnel = np.clip(
-        np.power(
-            np.clip(
-                1.0 + (sdf / 1500.0) * ((500.0 / 30.0) ** 2) + 0.20,
-                0.0,
-                2.0,
-            ),
-            5.0,
+    tint = np.array(tint_rgb, dtype=np.float32) / 255.0
+    tint01 = np.clip((1.0 - tint_opacity * 0.5) + tint * (tint_opacity * 0.5), 0.0, 1.0)
+    glass_rgb = glass_rgb * (1.0 - tint_opacity * 0.8) + (tint01 * 255.0) * (tint_opacity * 0.8)
+
+    fresnel = np.clip(np.power(
+        np.clip(
+            1.0 + sdf / 1500.0 * np.power(500.0 / max(1e-3, ref_fresnel_range), 2.0) + ref_fresnel_hardness,
+            0.0,
+            1.0,
         ),
-        0.0,
-        1.0,
-    )
-    glare_geo = np.clip(
-        np.power(
-            np.clip(
-                1.0 + (sdf / 1500.0) * ((500.0 / 30.0) ** 2) + 0.20,
-                0.0,
-                2.0,
-            ),
-            5.0,
+        5.0
+    ), 0.0, 1.0)
+    glare_geo = np.clip(np.power(
+        np.clip(
+            1.0 + sdf / 1500.0 * np.power(500.0 / max(1e-3, glare_range), 2.0) + glare_hardness,
+            0.0,
+            1.0,
         ),
+        5.0
+    ), 0.0, 1.0)
+
+    normal = np.stack([grad_x, grad_y], axis=-1)
+    normal_len = np.clip(np.linalg.norm(normal, axis=-1), 1e-6, 4.0)
+    normal_unit = normal / normal_len[..., None]
+    normal_angle = np.arctan2(normal_unit[..., 1], normal_unit[..., 0])
+    glare_angle = (normal_angle - math.pi / 4.0 + math.radians(light_angle_deg)) * 2.0
+    glare_farside = (
+        ((glare_angle > math.pi * 1.5) & (glare_angle < math.pi * 3.5))
+        | (glare_angle < -math.pi * 0.5)
+    )
+    glare_angle_factor = (0.5 + np.sin(glare_angle) * 0.5) * np.where(
+        glare_farside, 1.2 * glare_opposite_factor, 1.2
+    ) * glare_factor
+    glare_angle_factor = np.clip(
+        np.power(np.clip(glare_angle_factor, 0.0, 1.0), 0.1 + glare_convergence * 2.0),
         0.0,
         1.0,
     )
-    normal_ang = np.arctan2(grad_y, grad_x)
-    glare_ang = (normal_ang - (math.pi * 0.25) + math.radians(light_angle_deg)) * 2.0
-    glare_far = np.where(
-        ((glare_ang > math.pi * 1.5) & (glare_ang < math.pi * 3.5)) | (glare_ang < -math.pi * 0.5),
-        1.0,
-        0.0,
-    )
-    glare_angle = (0.5 + np.sin(glare_ang) * 0.5) * np.where(glare_far > 0.5, 0.96, 1.2)
-    glare_angle = np.clip(np.power(np.clip(glare_angle * 0.9, 0.0, 1.0), 1.1), 0.0, 1.0)
 
-    fresnel_mix = np.clip(fresnel * 0.24, 0.0, 0.45)[..., None]
-    glare_mix = np.clip(glare_angle * glare_geo * (0.28 if is_hovered or is_active else 0.18), 0.0, 0.55)[..., None]
-    glass_rgb = glass_rgb * (1.0 - fresnel_mix) + 255.0 * fresnel_mix
-    glass_rgb = glass_rgb * (1.0 - glare_mix) + 255.0 * glare_mix
+    fresnel_tint = _srgb_to_lch(np.broadcast_to(tint01, glass_rgb.shape))
+    fresnel_tint[..., 0] = np.clip(fresnel_tint[..., 0] + 20.0 * fresnel * ref_fresnel_factor, 0.0, 100.0)
+    fresnel_rgb = _lch_to_srgb(fresnel_tint) * 255.0
+    fresnel_mix = np.clip(fresnel * ref_fresnel_factor * 0.7 * normal_len, 0.0, 1.0)[..., None]
+    glass_rgb = glass_rgb * (1.0 - fresnel_mix) + fresnel_rgb * fresnel_mix
 
-    # Keep antialiased transition with untouched backdrop outside the glass.
-    smooth_edge = smooth_step(-0.75, 0.75, sdf)
-    out_rgb = glass_rgb * inside[..., None] + sharp_backdrop * (~inside)[..., None]
-    out_rgb = out_rgb * (1.0 - smooth_edge[..., None]) + sharp_backdrop * smooth_edge[..., None]
+    blur_srgb = np.clip(glass_rgb / 255.0, 0.0, 1.0)
+    glare_base = blur_srgb * (1.0 - tint_opacity * 0.5) + tint * (tint_opacity * 0.5)
+    glare_tint = _srgb_to_lch(np.clip(glare_base, 0.0, 1.0))
+    glare_tint[..., 0] = np.clip(glare_tint[..., 0] + 150.0 * glare_angle_factor * glare_geo, 0.0, 120.0)
+    glare_tint[..., 1] = np.clip(glare_tint[..., 1] + 30.0 * glare_angle_factor * glare_geo, 0.0, 140.0)
+    glare_rgb = _lch_to_srgb(glare_tint) * 255.0
+    glare_mix = np.clip(glare_angle_factor * glare_geo * normal_len, 0.0, 1.0)[..., None]
+    glass_rgb = glass_rgb * (1.0 - glare_mix) + glare_rgb * glare_mix
 
+    out_rgb = np.where(inside[..., None], glass_rgb, sharp_backdrop)
+    out_rgb = out_rgb * (1.0 - smooth_step(-0.001, 0.001, sdf)[..., None]) + sharp_backdrop * smooth_step(-0.001, 0.001, sdf)[..., None]
     return np.clip(out_rgb, 0.0, 255.0), alpha_mask
 
 
@@ -346,12 +433,12 @@ def composite_liquid_glass_pill(
     x1: int,
     y1: int,
     radius: float,
-    refraction_height: float = 12.0,
-    refraction_amount: float = 20.0,
-    chromatic_aberration: float = 1.8,
+    refraction_height: float = 20.0,
+    refraction_amount: float = 0.05,
+    chromatic_aberration: float = LGS_REF_DISPERSION,
     is_hovered: bool = False,
     is_active: bool = False,
-    light_angle_deg: float = 135.0,
+    light_angle_deg: float = LGS_GLARE_ANGLE_DEG,
     mouse_offset: tuple[float, float] = (0.0, 0.0),
     tint_rgb: tuple[float, float, float] = (255.0, 255.0, 255.0),
     tint_opacity: float = 0.0,
@@ -373,6 +460,10 @@ def composite_liquid_glass_pill(
         round(radius, 1),
         bool(is_hovered),
         bool(is_active),
+        round(refraction_height, 2),
+        round(refraction_amount, 4),
+        round(chromatic_aberration, 2),
+        round(light_angle_deg, 2),
         round(tint_opacity, 2),
         round(shadow_opacity, 2),
     )
@@ -862,14 +953,14 @@ def _get_window_base(w: int, h: int, backdrop_rgb: np.ndarray, expanded: bool = 
         cy=cy,
         half_w=half_w,
         half_h=half_h,
-        refraction_height=34.0,
-        refraction_amount=46.0,
-        chromatic_aberration=2.0,
+        refraction_height=20.0,
+        refraction_amount=0.05,
+        chromatic_aberration=LGS_REF_DISPERSION,
         tint_rgb=(255.0, 255.0, 255.0),
         tint_opacity=0.0,
         is_hovered=False,
         is_active=False,
-        light_angle_deg=135.0,
+        light_angle_deg=LGS_GLARE_ANGLE_DEG,
     )
 
     outer_shadow = np.exp(-0.5 * (np.maximum(0.0, sdf) / 5.5) ** 2) * smooth_step(-0.75, 0.75, sdf)
@@ -881,7 +972,7 @@ def _get_window_base(w: int, h: int, backdrop_rgb: np.ndarray, expanded: bool = 
     composite_liquid_glass_pill(
         base_rgb, base_alpha, backdrop_rgb, frosted_deep,
         ix0, iy0, ix1, iy1, radius=16.0,
-        refraction_height=12.0, refraction_amount=22.0,
+        refraction_height=20.0, refraction_amount=0.05,
         is_hovered=True,
     )
 
@@ -889,7 +980,7 @@ def _get_window_base(w: int, h: int, backdrop_rgb: np.ndarray, expanded: bool = 
     composite_liquid_glass_pill(
         base_rgb, base_alpha, backdrop_rgb, frosted_deep,
         wx0, wy0, wx1, wy1, radius=22.0,
-        refraction_height=11.0, refraction_amount=20.0,
+        refraction_height=20.0, refraction_amount=0.05,
         is_hovered=True,
     )
 
@@ -897,7 +988,7 @@ def _get_window_base(w: int, h: int, backdrop_rgb: np.ndarray, expanded: bool = 
     composite_liquid_glass_pill(
         base_rgb, base_alpha, backdrop_rgb, frosted_deep,
         px0, py0, px1, py1, radius=12.0,
-        refraction_height=8.0, refraction_amount=16.0,
+        refraction_height=20.0, refraction_amount=0.045,
         tint_rgb=(215.0, 232.0, 248.0), tint_opacity=0.22,
         shadow_opacity=0.14,
     )
@@ -906,7 +997,7 @@ def _get_window_base(w: int, h: int, backdrop_rgb: np.ndarray, expanded: bool = 
     composite_liquid_glass_pill(
         base_rgb, base_alpha, backdrop_rgb, frosted_deep,
         bx0, by0, bx1, by1, radius=23.0,
-        refraction_height=14.0, refraction_amount=26.0,
+        refraction_height=20.0, refraction_amount=0.05,
         is_hovered=True, is_active=True,
         tint_rgb=(255.0, 255.0, 255.0), tint_opacity=0.22,
     )
@@ -915,7 +1006,7 @@ def _get_window_base(w: int, h: int, backdrop_rgb: np.ndarray, expanded: bool = 
     composite_liquid_glass_pill(
         base_rgb, base_alpha, backdrop_rgb, frosted_deep,
         cx0, cy0, cx1, cy1, radius=23.0,
-        refraction_height=14.0, refraction_amount=26.0,
+        refraction_height=20.0, refraction_amount=0.05,
         is_hovered=True, is_active=False,
         tint_rgb=(255.0, 255.0, 255.0), tint_opacity=0.12,
     )
@@ -1002,7 +1093,7 @@ def render_optical_window_rgba(
                 composite_liquid_glass_pill(
                     out_rgb, out_alpha, backdrop_rgb, frosted_deep,
                     cx_chip, cy_chip, cx_chip + cw, cy_chip + 34, radius=17.0,
-                    refraction_height=11.0, refraction_amount=22.0,
+                    refraction_height=20.0, refraction_amount=0.05,
                     is_hovered=active,
                     is_active=active,
                     tint_rgb=(255.0, 255.0, 255.0),
@@ -1144,14 +1235,14 @@ def _get_island_base(w: int, h: int, backdrop_rgb: np.ndarray) -> dict[str, np.n
         cy=cy,
         half_w=half_w,
         half_h=half_h,
-        refraction_height=30.0,
-        refraction_amount=42.0,
-        chromatic_aberration=2.0,
+        refraction_height=20.0,
+        refraction_amount=0.05,
+        chromatic_aberration=LGS_REF_DISPERSION,
         tint_rgb=(255.0, 255.0, 255.0),
         tint_opacity=0.0,
         is_hovered=False,
         is_active=False,
-        light_angle_deg=135.0,
+        light_angle_deg=LGS_GLARE_ANGLE_DEG,
     )
 
     outer_shadow = np.exp(-0.5 * (np.maximum(0.0, sdf) / 5.0) ** 2) * smooth_step(-0.75, 0.75, sdf)
@@ -1163,7 +1254,7 @@ def _get_island_base(w: int, h: int, backdrop_rgb: np.ndarray) -> dict[str, np.n
     composite_liquid_glass_pill(
         base_rgb, base_alpha, backdrop_rgb, frosted_deep,
         fx0, fy0, fx1, fy1, radius=20.0,
-        refraction_height=13.0, refraction_amount=22.0,
+        refraction_height=20.0, refraction_amount=0.05,
         is_hovered=True,
     )
 
@@ -1171,7 +1262,7 @@ def _get_island_base(w: int, h: int, backdrop_rgb: np.ndarray) -> dict[str, np.n
     composite_liquid_glass_pill(
         base_rgb, base_alpha, backdrop_rgb, frosted_deep,
         px0, py0, px1, py1, radius=10.0,
-        refraction_height=8.0, refraction_amount=16.0,
+        refraction_height=20.0, refraction_amount=0.045,
         tint_rgb=(215.0, 232.0, 248.0), tint_opacity=0.22,
         shadow_opacity=0.14,
     )
@@ -1181,7 +1272,7 @@ def _get_island_base(w: int, h: int, backdrop_rgb: np.ndarray) -> dict[str, np.n
     composite_liquid_glass_pill(
         base_rgb, base_alpha, backdrop_rgb, frosted_deep,
         p_cx - 25, cy_btn - 25, p_cx + 25, cy_btn + 25, radius=25.0,
-        refraction_height=13.0, refraction_amount=22.0,
+        refraction_height=20.0, refraction_amount=0.05,
         is_hovered=True,
     )
 
@@ -1189,7 +1280,7 @@ def _get_island_base(w: int, h: int, backdrop_rgb: np.ndarray) -> dict[str, np.n
     composite_liquid_glass_pill(
         base_rgb, base_alpha, backdrop_rgb, frosted_deep,
         x_cx - 28, cy_btn - 28, x_cx + 28, cy_btn + 28, radius=28.0,
-        refraction_height=14.0, refraction_amount=24.0,
+        refraction_height=20.0, refraction_amount=0.05,
         is_hovered=True,
     )
 
